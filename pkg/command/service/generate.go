@@ -16,9 +16,8 @@ package service
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"os"
+	"github.com/pkg/errors"
 	"strconv"
 	"strings"
 	"time"
@@ -27,14 +26,15 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/oidc"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	knativeapis "knative.dev/pkg/apis"
 	servingv1 "knative.dev/serving/pkg/apis/serving/v1"
 	servingv1client "knative.dev/serving/pkg/client/clientset/versioned/typed/serving/v1"
 
 	"github.com/spf13/cobra"
 
-	"knative.dev/kperf/pkg"
-	"knative.dev/kperf/pkg/generator"
+	"github.com/knative.dev/kperf/pkg"
+	"github.com/knative.dev/kperf/pkg/generator"
 )
 
 var (
@@ -57,13 +57,23 @@ For example:
 # To generate ksvc workload
 kperf service generate —n 500 —interval 20 —batch 20 --min-scale 0 --max-scale 5 (--nsprefix testns/ --ns nsname)
 `,
+		PreRunE: func(cmd *cobra.Command, args []string) error {
+			flags := cmd.Flags()
+			if flags.Changed("nsprefix") && flags.Changed("ns") {
+				return errors.New("Expected either namespace with prefix & range or only namespace name")
+			}
+			return nil
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			var nsRangeMap map[string]bool = map[string]bool{}
+			// Get namespace list from flags
+			nsNameList := []string{}
+			if nsPrefix == "" && ns == "" {
+				nsNameList = []string{"default"}
+			}
 			if nsPrefix != "" {
 				r := strings.Split(nsRange, ",")
 				if len(r) != 2 {
-					fmt.Printf("Expected Range like 1,500, given %s\n", nsRange)
-					os.Exit(1)
+					return errors.Errorf("Expected Range like 1,500, given %s\n", nsRange)
 				}
 				start, err := strconv.Atoi(r[0])
 				if err != nil {
@@ -75,51 +85,35 @@ kperf service generate —n 500 —interval 20 —batch 20 --min-scale 0 --max-s
 				}
 				if start > 0 && end > 0 && start <= end {
 					for i := start; i <= end; i++ {
-						nsRangeMap[fmt.Sprintf("%s-%d", nsPrefix, i)] = true
+						nsNameList = append(nsNameList, fmt.Sprintf("%s-%d", nsPrefix, i))
 					}
 				} else {
 					return errors.New("failed to parse namespace range")
 				}
+			} else if ns != "" {
+				nsNameList = append(nsNameList, ns)
 			}
 
+			if len(nsNameList) == 0 {
+				return fmt.Errorf("no namespace found %s", nsPrefix)
+			}
+
+			// Check if namespace exists, in NOT, return error
+			for _, ns := range nsNameList {
+				_, err := p.ClientSet.CoreV1().Namespaces().Get(context.TODO(), ns, metav1.GetOptions{})
+				if err != nil && apierrors.IsNotFound(err) {
+					return errors.Errorf("namespace %s not found, please create one", ns)
+				} else if err != nil {
+					return errors.Wrap(err, "failed to get namespace")
+				}
+			}
+
+			restConfig, err := p.RestConfig()
+			ksvcClient, err = servingv1client.NewForConfig(restConfig)
 			if err != nil {
 				return err
 			}
-			nsNameList := []string{}
-			if ns != "" {
-				nss, err := p.ClientSet.CoreV1().Namespaces().Get(context.TODO(), ns, metav1.GetOptions{})
-				if err != nil {
-					return err
-				}
-				nsNameList = append(nsNameList, nss.Name)
-			} else if nsPrefix != "" {
-				nsList, err := p.ClientSet.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
-				if err != nil {
-					return err
-				}
-				if len(nsList.Items) == 0 {
-					return fmt.Errorf("no namespace found with prefix %s", nsPrefix)
-				}
-				if len(nsRangeMap) >= 0 {
-					for i := 0; i < len(nsList.Items); i++ {
-						if _, exists := nsRangeMap[nsList.Items[i].Name]; exists {
-							nsNameList = append(nsNameList, nsList.Items[i].Name)
-						}
-					}
-				} else {
-					for i := 0; i < len(nsList.Items); i++ {
-						if strings.HasPrefix(nsList.Items[i].Name, nsPrefix) {
-							nsNameList = append(nsNameList, nsList.Items[i].Name)
-						}
-					}
-				}
 
-				if len(nsNameList) == 0 {
-					return fmt.Errorf("no namespace found with prefix %s", nsPrefix)
-				}
-			} else {
-				return fmt.Errorf("both ns and nsPrefix are empty")
-			}
 			if checkReady {
 				generator.NewBatchGenerator(time.Duration(interval)*time.Second, count, batch, concurrency, nsNameList, createKSVC, checkServiceStatusReady, p).Generate()
 			} else {
